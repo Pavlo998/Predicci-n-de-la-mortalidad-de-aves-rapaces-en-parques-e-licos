@@ -1,0 +1,1055 @@
+---
+pdf_document:
+  keep_tex: false
+  number_sections: true
+  toc: true
+  toc_depth: 3
+author: "Pablo Casares Gaona"
+date: "`r format(Sys.Date(),'%e de %B, %Y')`"
+output:
+  html_document:
+    df_print: paged
+  pdf_document: default
+subtitle: Predicción de la mortalidad de aves rapaces en parques eólicos aplicando técnicas de aprendizaje automático
+title: "TFM"
+html_document:
+  toc: true
+  toc_float: true
+  keep_md: true
+  toc_depth: 3
+  css: null
+params:
+  myfile: Mortalidad_TFM.xlsx
+link-citations: true
+editor_options:
+  markdown:
+    wrap: 72
+---
+
+```{r setup, include=FALSE}
+require(knitr)
+opts_chunk$set(comment = NA, prompt = TRUE, tidy = FALSE, fig.width = 7, fig.height = 7,echo = TRUE, message = TRUE, warning = FALSE, cache = TRUE)
+```
+
+```{r packages, message=FALSE, echo=FALSE, warning=FALSE}
+usePackage <- function(p) {    
+    if (!is.element(p, installed.packages()[,1]))
+        install.packages(p, dep = TRUE)
+    require(p, character.only = TRUE)
+}
+usePackage("caret")
+usePackage("readxl")
+usePackage("ggplot2")
+usePackage("dplyr")
+usePackage("lubridate")
+usePackage("ROSE")
+usePackage("rpart")
+usePackage("rpart.plot")
+usePackage("e1071")
+usePackage("class")
+usePackage("randomForest")
+usePackage("xgboost")
+usePackage("nnet")
+usePackage("glmnet")
+usePackage("pROC")
+usePackage("data.table")
+usePackage("pbapply")
+usePackage("car")
+usePackage("kernlab")
+```
+
+\pagebreak
+
+# Obtención de los datos
+
+Cargamos le dataset y mostramos su estrcutura:
+
+```{r}
+datos_iniciales <- read_xlsx(params$myfile)
+str(datos_iniciales)
+```
+Observamos que nuestro dataset presenta 6392 observaciones y 28 variables.
+
+Mostramos un resumen de cada variable del dataset:
+
+```{r}
+summary(datos_iniciales)
+```
+
+Para hacernos una idea de como son las observaciones de este dataset podemos mostrar las primeras observaciones del mismo:
+
+```{r}
+head(datos_iniciales)
+```
+
+# Limpieza y transformación de los datos
+
+Eliminaremos las columnas con información supeflua como "tipo_mortalidad" o "Id", columnas con información redundante como "Fecha" y las columnas que apenas contienen datos como "MUSCULO" o "ANTEBRAZO". Estas últimas columnas podrían servir para futuros proyectos si se tomaran los datos correspondientes para todas las observaciones.
+
+```{r}
+datos <- datos_iniciales %>% select(-Id, , -id_proyecto, -Fecha, -Longitud, -Latitud, 
+                                    -Altitud, -Especie, -distancia, -orientacion, 
+                                    -Nombre_científico, -permanencia, -ALA, -PESO, 
+                                    -GRASA, -MUSCULO, -tipo_mortalidad, -ANTEBRAZO, 
+                                    -estado_cuerpo)
+datos
+```
+
+Ahora tranformamos los datos al formato correcto para proceder con los análisis:
+
+```{r}
+# Asegurar que "Contactos", "Estación", "Edad" y "Sexo" sean factores
+datos$Contactos <- factor(datos$Contactos, levels = c("Vivos", "Muertos"))
+datos$Estación <- factor(datos$Estación)
+datos$Edad <- factor(datos$Edad, levels = c("Pollo", "Juvenil", "Adulto", 
+                                            "Sin especificar"))
+datos$Sexo <- factor(datos$Sexo, levels = c("Macho", "Hembra", "Indeterminado"))
+```
+
+# Análisis exploratorio
+
+## Frecuencia de contactos
+
+Mostramos la cantidad de observaciones que hay de individuos vivos y la cantidad de contactos de mortalidad que se han producido.
+
+```{r}
+# Tabla de frecuencia de contactos
+tabla_contactos <- datos %>%
+  group_by(Contactos) %>%
+  summarise(Frecuencia = n())
+
+# Gráfico de Contactos
+ggplot(tabla_contactos, aes(x = Contactos, y = Frecuencia, fill = Contactos)) +
+  geom_bar(stat = "identity") +
+  labs(title = "Frecuencia de individuos observados vivos y encontrados muertos", 
+       x = "Contactos", y = "Frecuencia") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+Observamos la mayor presencia de individuos observados vivos que de contactos de individuos muertos (lo esperado).
+
+## Mortalidad por estación
+
+También mostramos la distribución de la mortalidad según la estación del año.
+
+```{r}
+# Tabla y gráfico de mortalidad por estación
+tabla_estacion <- datos %>%
+  filter(Contactos == "Muertos") %>%
+  group_by(Estación) %>%
+  summarise(Mortalidad = n())
+
+ggplot(tabla_estacion, aes(x = Estación, y = Mortalidad, fill = Estación)) +
+  geom_bar(stat = "identity") +
+  labs(title = "Mortalidad por estación", x = "Estación", y = "Número de muertes") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+La estación con mayor mortalidad es verano y la estación con menor mortalidad es invierno.
+
+## Comparación de mortalidad entre estaciones
+
+La prueba de Chi-cuadrado nos permite determinar si existe una relación significativa entre dos variables categóricas, en este caso la mortalidad y la estación del año.
+
+```{r}
+tabla_mortalidad_estacion <- table(datos$Contactos, datos$Estación)
+
+# Prueba de Chi-cuadrado
+chisq.test(tabla_mortalidad_estacion)
+```
+
+El p-valor menor de 0,05 nos indica que existe una relación significativa entre la mortalidad y la estación del año, confirmando lo observado en el gráfico del apartado anterior.
+
+## Distribución por especie y mortalidad
+
+También podemos mostrar la distribución de la mortalidad según la especie.
+
+```{r}
+# Tabla y gráfico de especies muertas
+tabla_especie <- datos %>%
+  filter(Contactos == "Muertos") %>%
+  group_by(`Nombre_común`) %>%
+  summarise(Muertes = n()) %>%
+  arrange(desc(Muertes))
+
+ggplot(tabla_especie, aes(x = reorder(`Nombre_común`, -Muertes), y = Muertes)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  labs(title = "Número de muertes por especie", x = "Especie", y = "Muertes") +
+  coord_flip() +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+La especie con mayor mortalidad es el buitre leonado, coincidiendo con datos de otros estudios.
+
+## Distribución de la mortalidad según el diámetro de los aerogeneradores
+
+```{r}
+# Calcular mortalidad media por diámetro de turbinas
+mortalidad_diametro <- datos %>%
+  filter(Contactos == "Muertos") %>%
+  group_by(Diámetro) %>%
+  summarise(Mortalidad = n())
+
+# Gráfico de mortalidad por diámetro de turbinas
+ggplot(mortalidad_diametro, aes(x = Diámetro, y = Mortalidad)) +
+  geom_point(color = "darkgreen") +
+  geom_smooth(method = "lm", se = FALSE, color = "blue") +
+  labs(title = "Mortalidad de aves según el diámetro de las turbinas",
+       x = "Diámetro de turbinas (m)", y = "Número de muertes") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+Parece haber una tendencia que indica que a mayor diámetro de las turbinas eólicas mayor será la mortalidad.
+
+# Preprocesado de datos
+
+## Tratamiento de datos faltantes
+
+Primero comprobamos si hay datos faltantes:
+
+```{r}
+sum(is.na(datos))
+```
+
+Puesto que no hay datos faltantes no es necesario realizar ningún tratamiento en este sentido.
+
+## Creación de nuevas variables
+
+Podemos dividir la variable "Hora" en periodos de tiempo como "día", "tarde" y "noche":
+
+```{r}
+# Crear una nueva variable 'Periodo_dia' basada en la hora
+datos$Periodo_dia <- cut(as.numeric(format(datos$Hora, "%H")),
+                         breaks = c(-1, 5, 11, 17, 24),
+                         labels = c("Noche", "Mañana", "Tarde", "Noche"),
+                         right = TRUE)
+
+# Eliminamos la columna de Hora
+datos <- datos %>% select(-Hora)
+```
+
+## Codificación de variables categóricas
+
+Los modelos de aprendizaje automático requieren que las variables categóricas sean numéricas. Este proceso de asignar un número a cada variable categórica se denomina Label encoding.
+
+```{r}
+# Convertir los meses a números de 1 a 12
+datos$Mes <- as.numeric(factor(datos$Mes, levels = c("Enero", "Febrero", "Marzo", 
+                                                     "Abril", "Mayo", "Junio", 
+                                                     "Julio", "Agosto", "Septiembre", 
+                                                     "Octubre", "Noviembre", "Diciembre")))
+
+# Convertir las estaciones a números de 1 a 4
+datos$Estación <- as.numeric(factor(datos$Estación, levels = c("Invierno", "Primavera", 
+                                                               "Verano", "Otoño")))
+
+# Convertir los nombres de las especies a números
+datos$Nombre_común <- as.numeric(as.factor(datos$Nombre_común))
+
+# Convertir las edades a números
+datos$Edad <- as.numeric(factor(datos$Edad, levels = c("Pollo", "Juvenil", "Adulto", 
+                                                       "Sin especificar")))
+
+# Convertir el sexo del individuo a números
+datos$Sexo <- as.numeric(factor(datos$Sexo, levels = c("Macho", "Hembra", 
+                                                       "Indeterminado")))
+
+# Convertir el el periodo del día del individuo a números
+datos$Periodo_dia <- as.numeric(factor(datos$Periodo_dia, levels = c("Noche", "Mañana", 
+                                                                     "Tarde"), ordered = TRUE))
+```
+
+## Identificación y tratmiento de valores atípicos (outliers)
+
+Usaremos el rango intercuartílico (IQR) como una de las técnicas más comunes para identificar valores atípicos. La idea es calcular el IQR y considerar como outliers aquellos valores que caen por debajo de Q1-1.5 × IQR o por encima de Q3-1.5 × IQR donde Q1 es el primer cuartil y Q3 es el tercer cuartil.
+
+```{r}
+# Cálculo de IQR para Potencia unitaria
+Q1 <- quantile(datos$Potencia_unitaria, 0.25, na.rm = TRUE)
+Q3 <- quantile(datos$Potencia_unitaria, 0.75, na.rm = TRUE)
+IQR <- Q3 - Q1
+
+# Identificación de outliers
+outliers_potencia <- datos$Potencia_unitaria < (Q1 - 1.5 * IQR) | 
+  datos$Potencia_unitaria > (Q3 + 1.5 * IQR)
+cat("Número de outliers en Potencia unitaria:", sum(outliers_potencia), "\n")
+
+# Tratamiento de outliers
+datos <- datos[!outliers_potencia, ]
+
+# Cálculo de IQR para Diámetro
+Q1 <- quantile(datos$Diámetro, 0.25, na.rm = TRUE)
+Q3 <- quantile(datos$Diámetro, 0.75, na.rm = TRUE)
+IQR <- Q3 - Q1
+
+# Identificación de outliers
+outliers_diametro <- datos$Diámetro < (Q1 - 1.5 * IQR) | datos$Diámetro > 
+  (Q3 + 1.5 * IQR)
+cat("Número de outliers en Diámetro:", sum(outliers_diametro), "\n")
+```
+
+## División del conjunto de datos de entrenamiento y prueba
+
+Dividiremos el los datos en un 70% de datos de entrenamiento y un 30% de datos de prueba:
+
+```{r}
+# Establecemos la semilla
+set.seed(12345)
+
+# Dividimos el conjunto de datos en entrenamiento y prueba
+trainIndex <- createDataPartition(datos$Contactos, p = 0.7, list = FALSE)
+datos_train <- datos[trainIndex, ]    # Conjunto de entrenamiento (70% de los datos)
+datos_test <- datos[-trainIndex, ]    # Conjunto de prueba (30% de los datos)
+
+# Verificamos las dimensiones de cada conjunto
+cat("Dimensiones del conjunto de entrenamiento:", dim(datos_train), "\n")
+cat("Dimensiones del conjunto de prueba:", dim(datos_test), "\n")
+```
+## Balanceo de las clases de mortalidad
+
+Mostramos cuantas observaciones hay en cada clase:
+
+```{r}
+# Conteo de observaciones en cada clase
+table(datos_train$Contactos)
+```
+
+Debido al gran desbalanceo procederemos al sobremuestreo de la clase minoritaria y el submuestreo de la clase mayoritaria:
+
+```{r}
+# Aplicar sobremuestreo a la clase minoritaria
+datos_balanceados <- ROSE(Contactos ~ ., data = datos_train, seed = 12345)$data
+
+# Verificar la nueva distribución de clases
+table(datos_balanceados$Contactos)
+```
+
+Podemos observar que la clase minoritaria ha aumentado, permitiendo así tener más datos de esta clase, y la mayoritaria ha disminuido.
+
+## Normalización de variables numéricas
+
+Para evitar que las diferencias de escala entre variables afecten los modelos, conviene normalizar las variables numéricas.
+
+```{r}
+# Calculamos los mínimos y máximos del conjunto de entrenamiento
+min_potencia <- min(datos_train$Potencia_unitaria)
+max_potencia <- max(datos_train$Potencia_unitaria)
+
+min_diametro <- min(datos_train$Diámetro)
+max_diametro <- max(datos_train$Diámetro)
+
+# Normalizamos las variables numéricas del conjunto de entrenamiento
+
+datos_train$Potencia_unitaria <- (datos_train$Potencia_unitaria - min_potencia) /
+  (max_potencia - min_potencia)
+
+datos_train$Diámetro <- (datos_train$Diámetro - min_diametro) /
+  (max_diametro - min_diametro)
+
+# Normalizamos las variables numéricas del conjunto de prueba
+datos_test$Potencia_unitaria <- (datos_test$Potencia_unitaria - min_potencia) /
+  (max_potencia - min_potencia)
+
+datos_test$Diámetro <- (datos_test$Diámetro - min_diametro) /
+  (max_diametro - min_diametro)
+
+# Verificamos el resultado
+
+summary(datos_train$Potencia_unitaria)
+summary(datos_test$Potencia_unitaria)
+
+summary(datos_train$Diámetro)
+summary(datos_test$Diámetro)
+```
+
+# Tipos de algoritmos
+
+## Regresión logística
+
+```{r}
+# Ajustamos modelo de regresión logística
+modelo_log <- glm(Contactos ~ ., data = datos_balanceados, family = binomial)
+
+# Predicciones en el conjunto de prueba
+pred_log <- predict(modelo_log, newdata = datos_test, type = "response")
+
+# Convertimos probabilidades en clases
+pred_clases <- ifelse(pred_log > 0.5, "Muertos", "Vivos")
+
+# Evaluamos el modelo
+confusionMatrix(as.factor(pred_clases), datos_test$Contactos)
+
+# Pasamos la variable objetivo a formato numérico
+roc_curve <- roc(datos_test$Contactos, as.numeric(pred_log))
+plot(roc_curve)
+auc(roc_curve)
+```
+
+### Ajuste del modelo de regresión logística
+
+```{r}
+# Evaluación de multicolinealidad
+# La multicolinealidad puede inflar los coeficientes de las variables. Por ello verificamos el Factor de Inflación de la Varianza (VIF)
+
+vif(modelo_log)
+```
+
+Como ninguna variable supera el VIF 5, no eliminamos ninguna.
+
+```{r}
+# Configuramos validación cruzada
+control <- trainControl(
+  method = "cv",                     # Validación cruzada
+  number = 10,                       # Número de particiones (10-fold CV)
+  classProbs = TRUE,                 # Calcular probabilidades para métricas
+  summaryFunction = twoClassSummary  # Métrica principal (ROC-AUC)
+)
+```
+
+```{r}
+# Creamos una rejilla con valores de alpha y lambda
+grid <- expand.grid(
+  alpha = c(0, 0.5, 1),          # Ridge (0), Elastic Net (0.5), Lasso (1)
+  lambda = 10^seq(-2, 2, length = 5)  # Lambda en escala logarítmica
+)
+
+# Entrenamos el modelo con glmnet
+modelo_log2 <- train(
+  Contactos ~ .,                 # Fórmula
+  data = datos_balanceados,      # Datos de entrenamiento
+  method = "glmnet",             # Regresión logística con regularización
+  tuneGrid = grid,               # Rejilla de hiperparámetros
+  trControl = control,           # Validación cruzada
+  metric = "ROC"                 # Maximizar el área bajo la curva ROC
+)
+
+# Mostramos la mejor combinación de hiperparámetros
+print(modelo_log2$bestTune)
+
+# Visualizamos los resultados
+plot(modelo_log2)
+
+# Predicciones
+predicciones <- predict(modelo_log2, datos_test)
+
+# Evaluamos el modelo
+confusionMatrix(predicciones, datos_test$Contactos)
+roc_curve <- roc(datos_test$Contactos, as.numeric(predicciones))
+plot(roc_curve)
+auc(roc_curve)
+```
+
+La optimización mediante validación cruzada ha mejorado el modelo en todas las métricas menos en especificidad (se mantiene) y en el valor AUC.
+
+## Naive Bayes
+
+```{r}
+# Ajustamos el modelo de Naive Bayes
+modelo_nb <- naiveBayes(Contactos ~ ., data = datos_balanceados, laplace = 0)
+
+# Predicciones
+pred_nb <- predict(modelo_nb, newdata = datos_test)
+
+# Evaluamos el modelo
+confusionMatrix(pred_nb, datos_test$Contactos)
+roc_curve <- roc(datos_test$Contactos, as.numeric(pred_nb))
+plot(roc_curve)
+auc(roc_curve)
+```
+
+### Ajuste del modelo de Naive Bayes
+
+```{r, warning=FALSE}
+# Configuramos la validación cruzada
+control <- trainControl(method = "cv", number = 10)  # 10 particiones de validación cruzada
+
+# Definimos la rejilla de hiperparámetros
+grid <- expand.grid(
+  fL = seq(0, 2, by = 0.5),         # Valores de suavizado Laplace
+  usekernel = c(TRUE, FALSE),       # Usar o no kernel
+  adjust = seq(0.5, 1.5, by = 0.5)  # Ajuste del ancho de banda del kernel
+)
+
+# Entrenamos el modelo Naive Bayes
+modelo_tuned <- train(
+  Contactos ~ .,                    # Fórmula del modelo
+  data = datos_balanceados,         # Conjunto de datos de entrenamiento
+  method = "nb",                    # Método Naive Bayes
+  trControl = control,              # Configuración de validación cruzada
+  tuneGrid = grid                   # Rejilla de hiperparámetros
+)
+
+# Vemos los mejores hiperparámetros
+print(modelo_tuned$bestTune)
+
+# Vemos resultados por combinación de hiperparámetros
+print(modelo_tuned$results)
+
+# Predicciones
+predicciones <- predict(modelo_tuned, datos_test)
+
+# Evaluamos el modelo
+confusionMatrix(predicciones, datos_test$Contactos)
+roc_curve <- roc(datos_test$Contactos, as.numeric(predicciones))
+plot(roc_curve)
+auc(roc_curve)
+```
+
+Ajustando los hiperparámetros del modelo mediante la validación cruzada se produce una mejora clara en la métrica de especificidad y en el valor AUC a costa de perder precisión y sensibilidad.
+
+## SVM
+
+```{r}
+# Ajustamos modelo SVM con un kernel lineal
+modelo_svm <- svm(Contactos ~ ., data = datos_balanceados, kernel = "linear")
+
+# Predicciones
+pred_svm <- predict(modelo_svm, newdata = datos_test)
+
+# Evaluamos el modelo
+confusionMatrix(pred_svm, datos_test$Contactos)
+roc_curve <- roc(datos_test$Contactos, as.numeric(pred_svm))
+plot(roc_curve)
+auc(roc_curve)
+```
+
+### Ajuste del modelo de SVM
+
+```{r}
+# Calculamos sigma usando la función sigest de kernlab
+sigma_est <- sigest(Contactos ~ ., data = datos_balanceados, frac = 0.75)
+
+# Configuramos el grid de hiperparámetros
+grid <- expand.grid(
+  C = c(0.1, 1, 10, 100),                              # Valores para C
+  sigma = c(sigma_est[1], sigma_est[2], sigma_est[3])  # Rango sugerido para sigma
+)
+
+# Configuramos la validación cruzada
+control <- trainControl(
+  method = "cv",
+  number = 5,
+  classProbs = TRUE,
+  summaryFunction = twoClassSummary
+)
+
+# Entrenamos el modelo SVM con kernel radial
+modelo_svm <- train(
+  Contactos ~ ., 
+  data = datos_balanceados, 
+  method = "svmRadial", 
+  metric = "ROC",
+  tuneGrid = grid, 
+  trControl = control
+)
+
+# Mejor combinación de hiperparámetros
+print(modelo_svm$bestTune)
+
+# Predicciones
+predicciones <- predict(modelo_svm, datos_test)
+
+# Evaluamos el modelo
+confusionMatrix(predicciones, datos_test$Contactos)
+roc_curve <- roc(datos_test$Contactos, as.numeric(predicciones))
+plot(roc_curve)
+auc(roc_curve)
+```
+
+Ajustando los hiperparámetros del modelo mediante la validación cruzada se produce un empeoramiento de la mayoría de las métricas (excepto la especificidad).
+
+## Árboles de decisión
+
+```{r}
+# Ajustamos árbol de decisión
+modelo_arbol <- rpart(Contactos ~ ., data = datos_balanceados, method = "class")
+
+# Predicciones
+pred_arbol <- predict(modelo_arbol, newdata = datos_test, type = "class")
+
+# Evaluamos el modelo
+confusionMatrix(pred_arbol, datos_test$Contactos)
+
+# Visualizamos el árbol
+rpart.plot(modelo_arbol)
+roc_curve <- roc(datos_test$Contactos, as.numeric(pred_arbol))
+plot(roc_curve)
+auc(roc_curve)
+```
+
+### Ajuste del modelo de árbol de decisiones
+
+```{r}
+# Configuramos la validación cruzada de 10 pliegues
+ctrl <- trainControl(method = "cv", number = 10, search = "grid", classProbs = TRUE, summaryFunction = twoClassSummary)
+
+# Definimos la cuadrícula de hiperparámetros para explorar
+grid_cp <- expand.grid(
+  cp = seq(0.01, 0.1, by = 0.01)         # Valor de cp entre 0.01 y 0.1
+)
+
+# Valores para maxdepth y minsplit
+valores_maxdepth <- c(5, 10, 15)  # Profundidad máxima
+valores_minsplit <- c(10, 20)     # Número mínimo de observaciones para dividir un nodo
+
+# Creamos una lista para almacenar resultados
+resultados <- list()
+mejor_auc <- 0  # Para rastrear el mejor modelo
+
+
+# Bucle para ajustar maxdepth y minsplit
+for (maxd in valores_maxdepth) {
+  for (mins in valores_minsplit) {
+    
+    # Configuramos el control manual con rpart.control()
+    control <- rpart.control(maxdepth = maxd, minsplit = mins)
+    
+    # Entrenamos el modelo con caret y ajustamos el cp
+    modelo <- train(
+      Contactos ~ ., 
+      data = datos_balanceados, 
+      method = "rpart", 
+      trControl = ctrl, 
+      tuneGrid = grid_cp, 
+      metric = "ROC",
+      control = control # Configuración de maxdepth y minsplit
+    )
+    
+    # Evaluamos el modelo
+    auc_actual <- max(modelo$results$ROC)
+    
+    # Guardamos el mejor modelo
+    if (auc_actual > mejor_auc) {
+      mejor_auc <- auc_actual
+      mejor_modelo <- modelo
+      mejor_params <- list(maxdepth = maxd, minsplit = mins, cp = modelo$bestTune$cp)
+    }
+    
+    # Guardamos los resultados de este ajuste
+    resultados[[paste("maxdepth", maxd, "minsplit", mins)]] <- list(
+      modelo = modelo,
+      auc = auc_actual
+    )
+  }
+}
+
+# Mostramos el mejor modelo y parámetros encontrados
+print(paste("Mejor AUC:", mejor_auc))
+print(mejor_params)
+
+# Predicciones
+pred_arbol_controlado <- predict(mejor_modelo, newdata = datos_test)
+
+# Evaluamos el modelo
+confusionMatrix(pred_arbol_controlado, datos_test$Contactos)
+roc_curve <- roc(datos_test$Contactos, as.numeric(pred_arbol_controlado))
+plot(roc_curve)
+auc(roc_curve)
+```
+
+Ajustando los hiperparámetros del modelo mediante la validación cruzada no se produce mejora en las métricas del modelo.
+
+## Random Forest
+
+```{r}
+# Establecemos la semilla
+set.seed(12345)
+
+# Ajustamos modelo Random Forest
+modelo_rf <- randomForest(Contactos ~ ., data = datos_balanceados, ntree = 100, importance = TRUE)
+
+# Predicciones
+pred_rf <- predict(modelo_rf, newdata = datos_test)
+
+# Evaluamos el modelo
+confusionMatrix(pred_rf, datos_test$Contactos)
+roc_curve <- roc(datos_test$Contactos, as.numeric(pred_rf))
+plot(roc_curve)
+auc(roc_curve)
+
+# Importancia de las variables
+varImpPlot(modelo_rf)
+```
+
+### Ajuste del modelo de Random Forest
+
+```{r}
+# Establecemos la semilla
+set.seed(12345)
+
+# Configuramos la validación cruzada
+control <- trainControl(
+  method = "repeatedcv",  # Validación cruzada repetida
+  number = 10,           # Número de particiones (folds)
+  repeats = 5,           # Número de repeticiones
+  search = "grid"        # Búsqueda en cuadrícula
+)
+
+# Creamos la cuadrícula de búsqueda
+parametros <- expand.grid(
+  mtry = c(2, 4, 6, 8)       # Número de predictores a probar en cada división
+)
+
+# Entrenamos el modelo Random Forest con búsqueda de hiperparámetros
+modelo_rf2 <- train(
+  Contactos ~ .,            # Fórmula del modelo
+  data = datos_balanceados, # Datos de entrenamiento
+  method = "rf",            # Especificar Random Forest
+  trControl = control,      # Esquema de validación cruzada
+  tuneGrid = parametros,    # Rango de hiperparámetros
+  ntree = 500               # Número de árboles fijo
+)
+
+# Mejor modelo y resultados
+print(modelo_rf2)
+
+# Mostramos el mejor valor de mtry
+best_mtry <- modelo_rf2$bestTune
+best_mtry
+
+# Predicciones
+pred_rf2 <- predict(modelo_rf2, newdata = datos_test)
+
+# Evaluamos el modelo
+confusionMatrix(pred_rf2, datos_test$Contactos)
+roc_curve <- roc(datos_test$Contactos, as.numeric(pred_rf2))
+plot(roc_curve)
+auc(roc_curve)
+```
+
+Ajustando los hiperparámetros del modelo mediante la validación cruzada se produce una ligera mejora en las métricas del modelo.
+
+## Gradient boosting
+
+```{r}
+set.seed(12345)
+
+# Convertimos datos en formato matriz para XGBoost
+datos_train_matrix <- as.matrix(datos_balanceados[, -1])  # Sin la columna objetivo
+datos_test_matrix <- as.matrix(datos_test[, -1])
+label_train <- as.numeric(datos_balanceados$Contactos == "Muertos")
+label_test <- as.numeric(datos_test$Contactos == "Muertos")
+
+# Ajustamos modelo XGBoost
+modelo_xgb <- xgboost(data = datos_train_matrix, label = label_train, nrounds = 100, objective = "binary:logistic", eval_metric = "auc")
+
+# Predicciones
+pred_xgb <- predict(modelo_xgb, newdata = datos_test_matrix, iteration_range = c(1, modelo_xgb$best_ntreelimit))
+pred_clases_xgb <- ifelse(pred_xgb > 0.5, "Muertos", "Vivos")
+
+# Evaluamos el modelo
+confusionMatrix(as.factor(pred_clases_xgb), datos_test$Contactos)
+roc_curve <- roc(datos_test$Contactos, pred_xgb)
+plot(roc_curve)
+auc(roc_curve)
+```
+
+# Ajuste del modelo Gradient Boosting
+
+```{r}
+# Establecemos la semilla
+set.seed(12345)
+
+# Creamos las matrices de entrenamiento y prueba
+dtrain <- xgb.DMatrix(data = as.matrix(datos_balanceados[, -1]), label = as.numeric(datos_balanceados$Contactos) - 1)
+dtest <- xgb.DMatrix(data = as.matrix(datos_test[, -1]), label = as.numeric(datos_test$Contactos) - 1)
+
+# Data table para almacenar resultados
+results <- data.table()
+
+# Creamos el grid de hiperparámetros
+param_grid <- expand.grid(
+  eta = c(0.01, 0.05, 0.1, 0.2),
+  max_depth = c(3, 6, 9),
+  gamma = c(0, 0.1, 0.2),
+  colsample_bytree = c(0.6, 0.8, 1),
+  min_child_weight = c(1, 3, 5),
+  subsample = c(0.6, 0.8, 1)
+)
+
+# Evaluamos cada combinación de hiperparámetros
+evaluate_model <- function(params, dtrain, dtest) {
+  # Validación cruzada con xgb.cv
+  cv <- xgb.cv(
+    params = params,
+    data = dtrain,
+    nrounds = 1000,
+    nfold = 5,
+    maximize = TRUE,
+    early_stopping_rounds = 50,
+    eval_metric = "auc",
+    verbose = FALSE
+  )
+  
+  # Extraemos el mejor AUC y número de iteraciones
+  best_auc <- max(cv$evaluation_log$test_auc_mean)
+  best_nrounds <- cv$best_iteration
+  
+  return(list(auc = best_auc, nrounds = best_nrounds))
+}
+
+# Bucle con retroalimentación de progreso
+results <- pblapply(1:nrow(param_grid), function(i) {
+  params <- as.list(param_grid[i, ])
+  params$objective <- "binary:logistic"
+  
+  # Evaluamos el modelo con los parámetros actuales
+  eval_result <- evaluate_model(params, dtrain, dtest)
+  
+  # Guardamos los resultados
+  return(data.table(
+    eta = params$eta,
+    max_depth = params$max_depth,
+    gamma = params$gamma,
+    colsample_bytree = params$colsample_bytree,
+    min_child_weight = params$min_child_weight,
+    subsample = params$subsample,
+    auc = eval_result$auc,
+    nrounds = eval_result$nrounds
+  ))
+})
+
+# Convertimos la lista de resultados en una tabla
+results <- rbindlist(results)
+
+# Ordenamos los resultados por AUC
+best_result <- results[order(-auc)][1]
+print(best_result)
+
+# Entrenamos el modelo final con los mejores hiperparámetros
+best_params <- as.list(best_result[, .(eta, max_depth, gamma, colsample_bytree, min_child_weight, subsample)])
+best_params$objective <- "binary:logistic"
+best_params$eval_metric <- "auc"
+
+modelo_xgb3 <- xgb.train(
+  params = best_params,
+  data = dtrain,
+  nrounds = best_result$nrounds,
+  watchlist = list(train = dtrain, test = dtest),
+  maximize = TRUE,
+  verbose = TRUE
+)
+
+# Predicciones
+pred_xgb3 <- predict(modelo_xgb3, newdata = datos_test_matrix)
+pred_clases_xgb3 <- ifelse(pred_xgb3 > 0.5, "Muertos", "Vivos")
+
+# Evaluamos el modelo final
+confusionMatrix(as.factor(pred_clases_xgb3), datos_test$Contactos)
+roc_curve <- roc(datos_test$Contactos, pred_xgb3)
+plot(roc_curve)
+auc(roc_curve)
+```
+
+Ajustando los hiperparámetros del modelo mediante la validación cruzada se produce un liger empeoramiento en las métricas
+
+## Redes Neuronales
+
+```{r}
+# Establecemos la semilla
+set.seed(12345)
+
+# Ajustamos red neuronal
+  
+
+# Predicciones
+pred_nn <- predict(modelo_nn, newdata = datos_test, type = "class")
+
+# Convertimos pred_nn a factor
+pred_nn <- factor(pred_nn, levels = levels(datos_test$Contactos))
+
+# Evaluamos el modelo
+confusionMatrix(pred_nn, datos_test$Contactos)
+roc_curve <- roc(datos_test$Contactos, as.numeric(pred_nn))
+plot(roc_curve)
+auc(roc_curve)
+```
+
+### Ajuste del modelo de Redes Neuronales
+
+```{r}
+# Establecemos la semilla
+set.seed(12345)
+
+# Creamos la cuadrícula de parámetros para la búsqueda
+grid <- expand.grid(
+  size = c(5, 10, 15),   # Número de unidades en la capa oculta
+  decay = c(0.1, 0.01)   # Tasa de regularización (decay)
+)
+
+# Configuramos la validación cruzada
+train_control <- trainControl(
+  method = "cv",          # Usamos validación cruzada
+  number = 5,             # 5 pliegues de validación
+  verboseIter = TRUE      # Mostrar progreso
+)
+
+# Entrenamos el modelo usando la red neuronal
+modelo_final <- train(
+  Contactos ~ .,            # Variable objetivo
+  data = datos_balanceados, # Datos de entrenamiento
+  method = "nnet",          # Usamos el modelo de red neuronal de nnet
+  trControl = train_control,# Validación cruzada
+  tuneGrid = grid           # Cuadrícula de hiperparámetros
+)
+
+# Vemos el resultado de la búsqueda
+print(modelo_final)
+
+# Predicción con el mejor modelo encontrado
+predicciones <- predict(modelo_final, newdata = datos_test)
+
+# Evaluamos el rendimiento
+confusionMatrix(predicciones, datos_test$Contactos)
+roc_curve <- roc(datos_test$Contactos, as.numeric(predicciones))
+plot(roc_curve)
+auc(roc_curve)
+```
+
+Ajustando los hiperparámetros del modelo mediante la validación cruzada se produce una mejora en alguna de las métricas del modelo, pero en detrimento de otras.
+
+# Optimización del modelo más preciso
+
+El modelo con mayor precisión es el modelo de Gradient Boosting. Realizamos un procecso de optimización del modelo para mejorar su eficacia. Para ello se utilizará la información de los hiperparámetros recogida en el ajuste del modelo mediante búsqueda de hiperparámetros y validación cruzada y se empleará junto a un grid search refinado, una validación cruzada estratificada y con un incremento en el número de pliegues, el cálculo del umbral óptimo, el incremento en el número de iteraciones.
+
+```{r}
+# Establecemos la semilla
+set.seed(12345)
+
+# Creamos las matrices de entrenamiento y prueba
+dtrain <- xgb.DMatrix(data = as.matrix(datos_balanceados[, -1]), label = as.numeric(datos_balanceados$Contactos) - 1)
+dtest <- xgb.DMatrix(data = as.matrix(datos_test[, -1]), label = as.numeric(datos_test$Contactos) - 1)
+
+# Data table para almacenar resultados
+results <- data.table()
+
+# Creamos el grid de hiperparámetros
+param_grid <- expand.grid(
+  eta = c(0.005, 0.01, 0.015, 0.02),
+  max_depth = c(5, 6, 7),
+  gamma = c(0.05, 0.1, 0.15),
+  colsample_bytree = c(0.7, 0.8, 0.9),
+  min_child_weight = c(1, 2, 3),
+  subsample = c(0.7, 0.8, 0.9)
+)
+
+# Evaluamos cada combinación de hiperparámetros
+evaluate_model <- function(params, dtrain, dtest) {
+  
+  # Validación cruzada con xgb.cv
+  cv <- xgb.cv(
+    params = params,
+    data = dtrain,
+    nrounds = 2000,
+    nfold = 10,
+    maximize = TRUE,
+    stratified = TRUE,
+    early_stopping_rounds = 50,
+    eval_metric = "auc",
+    verbose = FALSE
+  )
+  
+  # Extraemos el mejor AUC y número de iteraciones
+  best_auc <- max(cv$evaluation_log$test_auc_mean)
+  best_nrounds <- cv$best_iteration
+  
+  return(list(auc = best_auc, nrounds = best_nrounds))
+}
+
+# Lista para almacenar resultados
+results <- pblapply(1:nrow(param_grid), function(i) {
+  params <- as.list(param_grid[i, ])
+  params$objective <- "binary:logistic"
+  
+  # Evaluamos el modelo con los parámetros actuales
+  eval_result <- evaluate_model(params, dtrain, dtest)
+  
+  # Guardamos los resultados
+  return(data.table(
+    eta = params$eta,
+    max_depth = params$max_depth,
+    gamma = params$gamma,
+    colsample_bytree = params$colsample_bytree,
+    min_child_weight = params$min_child_weight,
+    subsample = params$subsample,
+    auc = eval_result$auc,
+    nrounds = eval_result$nrounds
+  ))
+})
+
+# Convertimos la lista de resultados en una tabla
+results <- rbindlist(results)
+
+# Ordenamos los resultados por AUC
+best_result <- results[order(-auc)][1]
+print(best_result)
+
+# Entrenamos el modelo final con los mejores hiperparámetros
+best_params <- as.list(best_result[, .(eta, max_depth, gamma, colsample_bytree, min_child_weight, subsample)])
+best_params$objective <- "binary:logistic"
+best_params$eval_metric <- "auc"
+
+modelo_xgb_final <- xgb.train(
+  params = best_params,
+  data = dtrain,
+  nrounds = best_result$nrounds,
+  watchlist = list(train = dtrain, test = dtest),
+  maximize = TRUE,
+  verbose = TRUE
+)
+
+# Función para calcular el umbral óptimo
+optimalThreshold <- function(true_labels, predicted_probs, metric = "F1") {
+  true_labels <- as.factor(true_labels)
+  if (length(levels(true_labels)) != 2) {
+    stop("La variable de etiquetas debe ser binaria.")
+  }
+  
+  thresholds <- seq(0, 1, by = 0.01)
+  
+  metrics <- sapply(thresholds, function(threshold) {
+    predicted_labels <- ifelse(predicted_probs > threshold, levels(true_labels)[2], levels(true_labels)[1])
+    predicted_labels <- factor(predicted_labels, levels = levels(true_labels))
+    
+    confusion <- confusionMatrix(predicted_labels, true_labels)
+    
+    if (metric == "F1") {
+      precision <- confusion$byClass["Pos Pred Value"]
+      recall <- confusion$byClass["Sensitivity"]
+      f1 <- 2 * ((precision * recall) / (precision + recall))
+      return(ifelse(is.na(f1), 0, f1))
+    } else if (metric == "Sensitivity") {
+      return(confusion$byClass["Sensitivity"])
+    } else if (metric == "Specificity") {
+      return(confusion$byClass["Specificity"])
+    } else if (metric == "Balanced Accuracy") {
+      sensitivity <- confusion$byClass["Sensitivity"]
+      specificity <- confusion$byClass["Specificity"]
+      return((sensitivity + specificity) / 2)
+    } else {
+      stop("Métrica no reconocida. Usa 'F1', 'Sensitivity', 'Specificity' o 'Balanced Accuracy'.")
+    }
+  })
+  
+  best_threshold <- thresholds[which.max(metrics)]
+  return(best_threshold)
+}
+
+# Predicciones y ajuste del umbral
+pred_xgb <- predict(modelo_xgb_final, newdata = datos_test_matrix)
+optimal_threshold <- optimalThreshold(datos_test$Contactos, pred_xgb, metric = "F1")
+pred_clases_xgb <- ifelse(pred_xgb > optimal_threshold, "Muertos", "Vivos")
+
+# Evaluamos el modelo final
+pred_clases_xgb <- factor(pred_clases_xgb, levels = levels(datos_test$Contactos))
+confusionMatrix(as.factor(pred_clases_xgb), datos_test$Contactos)
+roc_curve <- roc(datos_test$Contactos, pred_xgb)
+plot(roc_curve)
+auc(roc_curve)
+```
+
+
